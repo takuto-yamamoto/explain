@@ -246,6 +246,8 @@ let isLoopRunning = false
 let keepAliveTimer = null
 let fetchAbortCtrl = null
 let pdfjsLib     = null
+// 一括抽出した用語辞書 { "専門用語": "解説文", ... }
+let termDictionary = {}
 
 // ── PDF.JS LOADER ──────────────────────────────────────────────────────────
 // We import dynamically to avoid the <script type="module"> tag conflicting
@@ -297,7 +299,7 @@ async function extractTextFromPDF(file, onProgress) {
     if (cur.length) lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim())
     fullText += lines.filter(Boolean).join('\n') + '\n\n'
   }
-  return { sentences: splitSentences(fullText), pageCount }
+  return { sentences: splitSentences(fullText), fullText, pageCount }
 }
 
 function splitSentences(text) {
@@ -359,114 +361,76 @@ function speakText(text, rate = 1.0) {
   })
 }
 
-// ── RATE LIMITER ───────────────────────────────────────────────────────────
-// Gemini free tier: 15 RPM → enforce ≥4s between requests
-let lastFetchTime = 0
-async function waitForRateLimit() {
-  const MIN_INTERVAL = 4100  // ms — slightly over 4s to stay safely under 15 RPM
-  const now = Date.now()
-  const wait = MIN_INTERVAL - (now - lastFetchTime)
-  if (wait > 0) {
-    addLog(`⏳ API待機中 (${(wait / 1000).toFixed(1)}s)`)
-    await new Promise(r => setTimeout(r, wait))
-  }
-  lastFetchTime = Date.now()
-}
+// ── 一括用語抽出 ────────────────────────────────────────────────────────────
+// テキスト全体を1回のAPI呼び出しで分析し、用語辞書を構築する
+// 長すぎる場合は MAX_CHARS で切り詰めてから送信
+const MAX_CHARS = 12000
 
-// Simple heuristic: skip API call if sentence is unlikely to contain jargon
-const SKIP_PATTERNS = [
-  /^[\d\s,、。・…]+$/,          // numbers/punctuation only
-  /^.{1,12}[。！？]?$/,         // very short (≤12 chars)
-  /^(はい|いいえ|なお|また|つまり|例えば|したがって|よって|そのため|ただし|なぜなら)/,
-]
-function likelyHasJargon(sentence) {
-  return !SKIP_PATTERNS.some(p => p.test(sentence.trim()))
-}
-
-async function fetchExplanation(sentence, apiKey) {
-  // Skip obviously jargon-free sentences to save quota
-  if (!likelyHasJargon(sentence)) return { needsExplanation: false }
-
-  // Enforce rate limit
-  await waitForRateLimit()
-  if (abortFlag) return { needsExplanation: false }
-
+async function fetchTermDictionary(fullText, apiKey) {
   const modeStr = currentMode === 'definition'
-    ? '簡潔な定義重視（1〜2文で正確に定義してください）'
-    : '直感的な例え話重視（身近な例えを使って2文以内で説明してください）'
-  const already = [...explainedWords].join('、') || 'なし'
-  const sys = `あなたは専門教材の解説補助AIです。与えられたテキストから専門用語を特定し、指定されたモード（${modeStr}）に応じて、必ず【2文以内】で平易に解説してください。既出リストにある単語は完全に無視してください。ハルシネーション抑制のため、教科書の文脈にない創作は厳禁とします。定義外のものは「詳細なし」と返答してください。`
-  const usr = `以下の文章を読み上げ中です。この文章に含まれる専門用語を1つだけ選び、その用語と解説をJSON形式で返してください。\n\n文章:「${sentence}」\n\n既出単語（解説不要）: ${already}\n\nレスポンス形式（JSONのみ、前後のテキスト不要）:\n{"term":"専門用語名","explanation":"解説文","needsExplanation":true}\n専門用語がない場合や既出の場合:\n{"term":"","explanation":"","needsExplanation":false}`
+    ? '簡潔な定義重視（各用語を1〜2文で正確に定義してください）'
+    : '直感的な例え話重視（各用語を身近な例えを使って2文以内で説明してください）'
 
-  // Retry with exponential backoff on 429
-  const MAX_RETRIES = 3
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    if (abortFlag) return { needsExplanation: false }
+  // テキストが長すぎる場合は先頭から切り出す
+  const text = fullText.length > MAX_CHARS
+    ? fullText.slice(0, MAX_CHARS) + '\n…（以下省略）'
+    : fullText
 
-    const ctrl = new AbortController()
-    fetchAbortCtrl = ctrl
-    const poll = setInterval(() => { if (abortFlag) ctrl.abort() }, 80)
+  const sys = `あなたは専門教材の解説補助AIです。与えられたテキスト全体を読み、重要な専門用語を10〜30語程度抽出し、指定されたモード（${modeStr}）に応じて各用語の解説を生成してください。ハルシネーション抑制のため、テキストに存在しない用語の創作は厳禁です。レスポンスはJSONオブジェクトのみとし、前後の説明・マークダウンコードブロックは一切不要です。`
+  const usr = `以下のテキストを読み、重要な専門用語とその解説をまとめて抽出してください。\n\nテキスト:\n${text}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"専門用語1":"解説文1","専門用語2":"解説文2",...}`
 
-    try {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`,
-        {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: ctrl.signal,
-          body: JSON.stringify({
-            system_instruction: { parts: [{ text: sys }] },
-            contents: [{ parts: [{ text: usr }] }],
-            generationConfig: { temperature: 0.2, maxOutputTokens: 300, responseMimeType: 'application/json' },
-          }),
-        }
-      )
+  const ctrl = new AbortController()
+  fetchAbortCtrl = ctrl
+  const poll = setInterval(() => { if (abortFlag) ctrl.abort() }, 80)
 
-      if (res.status === 429) {
-        clearInterval(poll)
-        fetchAbortCtrl = null
-        const backoff = (attempt + 1) * 8000  // 8s, 16s, 24s
-        addLog(`⚠ API制限(429) — ${backoff / 1000}s後にリトライ (${attempt + 1}/${MAX_RETRIES})`)
-        await new Promise(r => setTimeout(r, backoff))
-        lastFetchTime = Date.now()  // reset rate limiter after backoff
-        continue
+  try {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-lite:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: sys }] },
+          contents: [{ parts: [{ text: usr }] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 4096, responseMimeType: 'application/json' },
+        }),
       }
+    )
 
-      if (!res.ok) {
-        const t = await res.text().catch(() => '')
-        throw new Error(`HTTP ${res.status}: ${t.slice(0, 120)}`)
-      }
-
-      const data  = await res.json()
-      const raw   = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}'
-      const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim()
-      try { return JSON.parse(clean) }
-      catch {
-        const m = clean.match(/\{[\s\S]*\}/)
-        if (m) try { return JSON.parse(m[0]) } catch { /* fall through */ }
-        return { needsExplanation: false }
-      }
-    } catch (e) {
-      if (e.name === 'AbortError') return { needsExplanation: false }
-      if (attempt === MAX_RETRIES - 1) {
-        showAlert('Gemini APIエラー: ' + e.message, 'warn')
-      }
-      return { needsExplanation: false }
-    } finally {
-      clearInterval(poll)
-      fetchAbortCtrl = null
+    if (res.status === 429) {
+      throw new Error('API制限(429): しばらく待ってから再度PDFをアップロードしてください')
     }
+    if (!res.ok) {
+      const t = await res.text().catch(() => '')
+      throw new Error(`HTTP ${res.status}: ${t.slice(0, 120)}`)
+    }
+
+    const data  = await res.json()
+    const raw   = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}'
+    const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim()
+
+    try { return JSON.parse(clean) }
+    catch {
+      // JSONブロックだけ取り出して再試行
+      const m = clean.match(/\{[\s\S]*\}/)
+      if (m) try { return JSON.parse(m[0]) } catch { /* fall through */ }
+      return {}
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') return {}
+    throw e  // 呼び出し元でハンドリング
+  } finally {
+    clearInterval(poll)
+    fetchAbortCtrl = null
   }
-  return { needsExplanation: false }
 }
 
 async function runLoop() {
   if (isLoopRunning) return
   isLoopRunning = true
   abortFlag = false
-  lastFetchTime = 0  // reset rate limiter on each new session
   startKeepAlive()
-  const apiKey = document.getElementById('api-key').value.trim()
 
   try {
     for (let i = 0; i < sentences.length; i++) {
@@ -477,7 +441,6 @@ async function runLoop() {
       setSpeechState('reading')
       highlightSentence(i)
 
-      // Speak first, then fetch — prevents request burst and gives TTS time to run
       try { await speakText(sentence, currentRate) }
       catch (e) {
         if (e.message === 'aborted') break
@@ -486,20 +449,23 @@ async function runLoop() {
       }
       if (abortFlag) break
 
-      // Fetch explanation after speaking (rate-limited + jargon-filtered inside)
-      let expData = null
-      if (apiKey) {
-        expData = await fetchExplanation(sentence, apiKey)
+      // 辞書から未解説の用語を部分一致で探す（1文に複数あれば最初の1つ）
+      let matchedTerm = null
+      let matchedExplanation = null
+      for (const [term, explanation] of Object.entries(termDictionary)) {
+        if (!explainedWords.has(term) && sentence.includes(term)) {
+          matchedTerm = term
+          matchedExplanation = explanation
+          break
+        }
       }
-      if (abortFlag) break
 
-      // Insert explanation if needed
-      if (expData?.needsExplanation && expData.term && expData.explanation) {
-        explainedWords.add(expData.term)
-        addWordTag(expData.term)
+      if (matchedTerm && matchedExplanation) {
+        explainedWords.add(matchedTerm)
+        addWordTag(matchedTerm)
         setSpeechState('explaining')
-        showExplainCard(expData.term, expData.explanation)
-        try { await speakText(`「${expData.term}」とは、${expData.explanation}`, Math.min(currentRate, 0.92)) }
+        showExplainCard(matchedTerm, matchedExplanation)
+        try { await speakText(`「${matchedTerm}」とは、${matchedExplanation}`, Math.min(currentRate, 0.92)) }
         catch { /* cancelled by skip — ok */ }
         if (abortFlag) break
         hideExplainCard()
@@ -783,6 +749,7 @@ window.resetPDF = function() {
 
 function resetWordState() {
   explainedWords = new Set()
+  termDictionary = {}
   document.getElementById('words-list').innerHTML = ''
   document.getElementById('words-card').style.display = 'none'
   hideExplainCard()
@@ -839,7 +806,8 @@ async function processFile(file) {
   dz.style.pointerEvents = 'none'
 
   try {
-    const { sentences: parsed, pageCount } = await extractTextFromPDF(file, (cur, total) => {
+    // ── フェーズ1: テキスト抽出 ──────────────────────────────────────────
+    const { sentences: parsed, fullText, pageCount } = await extractTextFromPDF(file, (cur, total) => {
       const pct = Math.round((cur / total) * 100)
       document.getElementById('drop-prog-fill').style.width   = pct + '%'
       document.getElementById('drop-prog-label').textContent  = `テキスト抽出中... ${pct}%`
@@ -853,6 +821,26 @@ async function processFile(file) {
     sentences = parsed
     renderTextPanel()
 
+    // ── フェーズ2: AI一括分析（APIキーがある場合のみ） ──────────────────
+    const apiKey = document.getElementById('api-key').value.trim()
+    termDictionary = {}  // 前回分をリセット
+
+    if (apiKey) {
+      document.getElementById('drop-prog-fill').style.width  = '100%'
+      document.getElementById('drop-prog-label').textContent = 'AIが専門用語を分析中...'
+      addLog('🤖 Gemini APIで専門用語を一括抽出中...')
+
+      try {
+        termDictionary = await fetchTermDictionary(fullText, apiKey)
+        const termCount = Object.keys(termDictionary).length
+        addLog(`📚 用語辞書構築完了: ${termCount}語を抽出`)
+      } catch (e) {
+        showAlert('AI解析エラー: ' + e.message, 'warn')
+        addLog('⚠ 用語抽出に失敗（TTS読み上げのみで続行）')
+      }
+    }
+
+    // ── UI切り替え ───────────────────────────────────────────────────────
     dz.style.display = 'none'
     document.getElementById('file-bar').style.display           = 'block'
     document.getElementById('file-name-label').textContent      = file.name
@@ -863,7 +851,6 @@ async function processFile(file) {
     document.getElementById('prog-label').textContent           = `0 / ${parsed.length} 文`
     document.getElementById('prog-pct').textContent             = '0%'
 
-    // Enable start button now that we have content
     document.getElementById('btn-start').disabled = false
 
     addLog(`✅ ${file.name}（${pageCount}ページ、${parsed.length}文）`)

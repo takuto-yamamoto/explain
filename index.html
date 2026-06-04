@@ -50,6 +50,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .drop-icon{width:64px;height:64px;border-radius:16px;background:rgba(37,99,235,0.1);border:1px solid rgba(37,99,235,0.22);display:flex;align-items:center;justify-content:center;margin-bottom:16px}
 #text-panel{max-height:58vh;min-height:300px;overflow-y:auto;border-radius:16px;padding:20px;background:#FFFFFF;border:1px solid var(--border);line-height:1.9;font-size:14px;box-shadow:0 1px 8px rgba(37,99,235,0.06)}
 .sentence{color:#64748B;transition:color .3s ease;border-radius:3px;padding:1px 3px;margin-right:2px;display:inline}
+.sentence.paused{background:rgba(37,99,235,0.08);color:#1D4ED8}
 .sentence.reading{color:#1D4ED8;animation:readPulse 1.2s ease-in-out infinite}
 .sentence.explaining{color:#92400E;animation:explainPulse 1s ease-in-out infinite}
 #progress-bar-fill{height:2px;border-radius:2px;transition:width .5s ease,background .3s}
@@ -543,7 +544,7 @@ function setSpeechState(s) {
 function highlightSentence(idx) {
   currentIdx = idx
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
-    el.classList.remove('reading', 'explaining')
+    el.classList.remove('reading', 'explaining', 'paused')
     if (parseInt(el.dataset.idx) === idx) {
       // Always set 'reading' here; showExplainCard will switch to 'explaining' when needed
       el.classList.add('reading')
@@ -745,19 +746,26 @@ window.handleStart = async function() {
     await stopLoop()
     // 再スタート時は解説済み単語をリセットしない（同じ文章の続きとして扱う）
   }
-  addLog('▶ 読み上げ開始')
   // currentIdx が途中なら、その文から再開（最初から読む場合は 0）
   const resumeFrom = currentIdx >= 0 && currentIdx < sentences.length ? currentIdx : 0
+  addLog(resumeFrom > 0 ? `▶ ${resumeFrom + 1}文目から再開` : '▶ 読み上げ開始')
   runLoop(resumeFrom)
 }
 
 window.handleStop = async function() {
+  const pausedAt = currentIdx  // 停止位置を保存
   await stopLoop()
   stopKeepAlive()
   setSpeechState('idle')
-  highlightSentence(-1)
+  // currentIdx をリセットせず、停止位置のハイライトを維持
+  currentIdx = pausedAt
+  // ハイライトを reading ではなく passive スタイルに切り替え
+  document.querySelectorAll('#text-panel .sentence').forEach(el => {
+    el.classList.remove('reading', 'explaining')
+    if (parseInt(el.dataset.idx) === pausedAt) el.classList.add('paused')
+  })
   hideExplainCard()
-  addLog('⏹ 停止')
+  addLog(`⏹ ${pausedAt >= 0 ? pausedAt + 1 + '文目で停止' : '停止'}`)
 }
 
 window.handleSkip = function() {

@@ -137,6 +137,10 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
           <button class="mode-btn" id="btn-definition" style="color:#fff" onclick="setMode('definition')">📖 定義重視</button>
           <button class="mode-btn" id="btn-analogy" style="color:var(--dim)" onclick="setMode('analogy')">💡 例え話</button>
         </div>
+        <div id="mode-rebuild-hint" style="display:none;margin-top:8px;font-size:11px;color:#D97706;align-items:center;gap:6px">
+          <span>モードを変更しました。</span>
+          <button onclick="rebuildDictionary()" style="background:none;border:none;cursor:pointer;color:#D97706;font-size:11px;font-weight:600;padding:0;text-decoration:underline">用語辞書を再生成</button>
+        </div>
       </div>
 
       <div class="card">
@@ -325,13 +329,18 @@ function splitSentences(text) {
 // ── SPEECH ENGINE ──────────────────────────────────────────────────────────
 function cancelSpeech() { window.speechSynthesis.cancel() }
 
+let keepAliveNudging = false
+
 function startKeepAlive() {
   stopKeepAlive()
   // Chrome stops speaking silently after ~15s; nudge it every 10s
   keepAliveTimer = setInterval(() => {
     if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+      keepAliveNudging = true
       window.speechSynthesis.pause()
       window.speechSynthesis.resume()
+      // Reset flag after a short delay to allow any spurious events to settle
+      setTimeout(() => { keepAliveNudging = false }, 100)
     }
   }, 10000)
 }
@@ -349,7 +358,7 @@ function speakText(text, rate = 1.0) {
     // Guard against onend/onerror both firing (browser quirk)
     let settled = false
     const done = (fn, v) => { if (settled) return; settled = true; fn(v) }
-    u.onend   = () => done(resolve, undefined)
+    u.onend   = () => { if (!keepAliveNudging) done(resolve, undefined) }
     u.onerror = e  => {
       if (e.error === 'interrupted' || e.error === 'canceled') {
         done(resolve, undefined)
@@ -426,14 +435,14 @@ async function fetchTermDictionary(fullText, apiKey) {
   }
 }
 
-async function runLoop() {
+async function runLoop(resumeFrom = 0) {
   if (isLoopRunning) return
   isLoopRunning = true
   abortFlag = false
   startKeepAlive()
 
   try {
-    for (let i = 0; i < sentences.length; i++) {
+    for (let i = resumeFrom; i < sentences.length; i++) {
       if (abortFlag) break
       const sentence = sentences[i]
       if (!sentence.trim()) continue
@@ -673,6 +682,7 @@ window.setRate = function(v) {
 }
 
 window.setMode = function(m) {
+  const prevMode = currentMode
   currentMode = m
   const thumb  = document.getElementById('mode-thumb')
   const btnDef = document.getElementById('btn-definition')
@@ -681,37 +691,69 @@ window.setMode = function(m) {
   thumb.style.left = m === 'definition' ? '4px' : 'calc(50% + 2px)'
   btnDef.style.color = m === 'definition' ? '#fff' : 'var(--dim)'
   btnAna.style.color = m === 'analogy'    ? '#fff' : 'var(--dim)'
+
+  // Show rebuild hint if dictionary already exists and mode actually changed
+  const hint = document.getElementById('mode-rebuild-hint')
+  const hasDictionary = Object.keys(termDictionary).length > 0
+  if (hint) {
+    hint.style.display = (hasDictionary && prevMode !== m) ? 'flex' : 'none'
+  }
 }
 
-window.handleStart = function() {
+window.rebuildDictionary = async function() {
+  const apiKey = document.getElementById('api-key').value.trim()
+  if (!apiKey) { showAlert('APIキーを入力してください', 'warn'); return }
+  if (sentences.length === 0) return
+  const hint = document.getElementById('mode-rebuild-hint')
+  if (hint) hint.style.display = 'none'
+
+  addLog('🔄 用語辞書を再生成中...')
+  // Re-assemble fullText from sentences for rebuild
+  const fullText = sentences.join('\n')
+  try {
+    termDictionary = await fetchTermDictionary(fullText, apiKey)
+    explainedWords = new Set()  // reset so re-explained with new mode
+    document.getElementById('words-list').innerHTML = ''
+    document.getElementById('words-card').style.display = 'none'
+    const termCount = Object.keys(termDictionary).length
+    addLog(`📚 用語辞書再構築完了: ${termCount}語`)
+  } catch (e) {
+    showAlert('再生成エラー: ' + e.message, 'warn')
+  }
+}
+
+// ループ停止を確実に待つ共通ヘルパー（Promise版）
+function stopLoop() {
+  return new Promise(resolve => {
+    if (!isLoopRunning) { resolve(); return }
+    abortFlag = true
+    cancelSpeech()
+    fetchAbortCtrl?.abort()
+    const t = setInterval(() => {
+      if (!isLoopRunning) { clearInterval(t); resolve() }
+    }, 50)
+  })
+}
+
+window.handleStart = async function() {
   if (sentences.length === 0) return
   if (!('speechSynthesis' in window)) {
     showAlert('このブラウザはWeb Speech APIに対応していません（Chrome/Edgeを使用してください）', 'err')
     return
   }
   if (isLoopRunning) {
-    abortFlag = true
-    cancelSpeech()
-    fetchAbortCtrl?.abort()
-    const waitForStop = setInterval(() => {
-      if (!isLoopRunning) {
-        clearInterval(waitForStop)
-        // 再スタート時は解説済み単語をリセットしない（同じ文章の続きとして扱う）
-        runLoop()
-      }
-    }, 50)
-  } else {
-    runLoop()
+    await stopLoop()
+    // 再スタート時は解説済み単語をリセットしない（同じ文章の続きとして扱う）
   }
   addLog('▶ 読み上げ開始')
+  // currentIdx が途中なら、その文から再開（最初から読む場合は 0）
+  const resumeFrom = currentIdx >= 0 && currentIdx < sentences.length ? currentIdx : 0
+  runLoop(resumeFrom)
 }
 
-window.handleStop = function() {
-  abortFlag = true
-  fetchAbortCtrl?.abort()
-  cancelSpeech()
+window.handleStop = async function() {
+  await stopLoop()
   stopKeepAlive()
-  // isLoopRunning reset happens in runLoop's finally block
   setSpeechState('idle')
   highlightSentence(-1)
   hideExplainCard()
@@ -725,26 +767,23 @@ window.handleSkip = function() {
   }
 }
 
-window.resetPDF = function() {
-  window.handleStop()
-  const waitAndReset = setInterval(() => {
-    if (!isLoopRunning) {
-      clearInterval(waitAndReset)
-      sentences = []
-      document.getElementById('drop-zone').style.display = 'flex'
-      document.getElementById('file-bar').style.display = 'none'
-      document.getElementById('text-panel').style.display = 'none'
-      document.getElementById('progress-section').style.display = 'none'
-      document.getElementById('progress-bar-fill').style.width = '0%'
-      document.getElementById('prog-label').textContent = '0 / 0 文'
-      document.getElementById('prog-pct').textContent = '0%'
-      document.getElementById('file-input').value = ''
-      clearLog()
-      resetWordState()
-      setSpeechState('idle')
-      resetDropZone()
-    }
-  }, 50)
+window.resetPDF = async function() {
+  await stopLoop()
+  stopKeepAlive()
+  setSpeechState('idle')
+  hideExplainCard()
+  sentences = []
+  document.getElementById('drop-zone').style.display = 'flex'
+  document.getElementById('file-bar').style.display = 'none'
+  document.getElementById('text-panel').style.display = 'none'
+  document.getElementById('progress-section').style.display = 'none'
+  document.getElementById('progress-bar-fill').style.width = '0%'
+  document.getElementById('prog-label').textContent = '0 / 0 文'
+  document.getElementById('prog-pct').textContent = '0%'
+  document.getElementById('file-input').value = ''
+  clearLog()
+  resetWordState()
+  resetDropZone()
 }
 
 function resetWordState() {
@@ -796,7 +835,8 @@ document.getElementById('file-input').addEventListener('change', e => {
 
 async function processFile(file) {
   if (!file) return
-  if (file.type !== 'application/pdf') { showAlert('PDFファイルのみ対応しています', 'warn'); return }
+  const isPdf = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')
+  if (!isPdf) { showAlert('PDFファイルのみ対応しています', 'warn'); return }
 
   const dz = document.getElementById('drop-zone')
   document.getElementById('drop-idle').style.display    = 'none'

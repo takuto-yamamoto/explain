@@ -49,7 +49,8 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 #drop-zone:hover{border-color:rgba(37,99,235,0.35);background:rgba(239,246,255,0.8)}
 .drop-icon{width:64px;height:64px;border-radius:16px;background:rgba(37,99,235,0.1);border:1px solid rgba(37,99,235,0.22);display:flex;align-items:center;justify-content:center;margin-bottom:16px}
 #text-panel{max-height:58vh;min-height:300px;overflow-y:auto;border-radius:16px;padding:20px;background:#FFFFFF;border:1px solid var(--border);line-height:1.9;font-size:14px;box-shadow:0 1px 8px rgba(37,99,235,0.06)}
-.sentence{color:#64748B;transition:color .3s ease;border-radius:3px;padding:1px 3px;margin-right:2px;display:inline}
+.sentence{color:#64748B;transition:color .3s ease,background .15s;border-radius:3px;padding:1px 3px;margin-right:2px;display:inline;cursor:pointer}
+.sentence:hover{background:rgba(37,99,235,0.07);color:#1E293B}
 .sentence.paused{background:rgba(37,99,235,0.08);color:#1D4ED8}
 .sentence.reading{color:#1D4ED8;animation:readPulse 1.2s ease-in-out infinite}
 .sentence.explaining{color:#92400E;animation:explainPulse 1s ease-in-out infinite}
@@ -671,9 +672,33 @@ function renderTextPanel() {
     span.className   = 'sentence'
     span.dataset.idx = i
     span.textContent = s + ' '
+    span.title = 'クリックしてここから開始'
+    span.addEventListener('click', () => seekTo(i))
     frag.appendChild(span)
   })
   panel.appendChild(frag)
+}
+
+async function seekTo(idx) {
+  // 読み上げ中なら止める
+  if (isLoopRunning) await stopLoop()
+  stopKeepAlive()
+  cancelSpeech()
+
+  // 全文のハイライトをリセットして、選択文を paused 表示
+  document.querySelectorAll('#text-panel .sentence').forEach(el => {
+    el.classList.remove('reading', 'explaining', 'paused')
+  })
+  currentIdx = idx
+  const target = document.querySelector(`#text-panel .sentence[data-idx="${idx}"]`)
+  if (target) {
+    target.classList.add('paused')
+    target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  }
+  updateProgress(idx, false)
+  setSpeechState('idle')
+  hideExplainCard()
+  addLog(`📍 ${idx + 1}文目を選択 — 開始ボタンでここから再開`)
 }
 
 // ── EVENT HANDLERS ─────────────────────────────────────────────────────────

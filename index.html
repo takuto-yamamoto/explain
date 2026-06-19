@@ -52,6 +52,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .para-block{margin-bottom:1.4em;line-height:2.0;border-left:3px solid transparent;padding-left:10px;border-radius:0 6px 6px 0;transition:border-color .3s}
 .para-block:last-child{margin-bottom:0}
 .para-block.has-reading{border-left-color:rgba(37,99,235,0.35)}
+.para-title{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#3B82F6;opacity:.75;margin-bottom:5px;padding:2px 4px;display:inline-block;background:rgba(37,99,235,0.07);border-radius:4px;user-select:none}
 .para-block.has-explaining{border-left-color:rgba(217,119,6,0.5)}
 .sentence{color:#64748B;transition:color .25s ease,background .15s,box-shadow .15s;border-radius:4px;padding:2px 4px;margin:1px 1px;display:inline;cursor:pointer}
 .sentence:hover{background:rgba(37,99,235,0.07);color:#1E293B}
@@ -303,6 +304,7 @@ let fetchAbortCtrl = null
 let pdfjsLib     = null
 // 一括抽出した用語辞書 { "専門用語": "解説文", ... }
 let termDictionary = {}
+let paraTitles     = {}     // { firstSentenceIdx: 'タイトル文字列' }
 let selectedVoice  = null   // SpeechSynthesisVoice | null
 let skipAnnotations = true  // 注釈（サイド注釈・脚注など）の読み上げをスキップするか
 
@@ -319,8 +321,43 @@ async function getPdfJs() {
 }
 
 // カラム（段組み）検出のしきい値
-const COLUMN_GAP_RATIO = 0.06   // ページ幅に対し、この比率以上の空白ギャップでカラム境界とみなす
-const ASIDE_WIDTH_RATIO = 0.34  // ページ幅に対し、この比率以下の幅しかないカラムは「サイド注釈」候補とみなす
+const COLUMN_GAP_RATIO  = 0.06   // ページ幅に対し、この比率以上の空白ギャップでカラム境界とみなす
+const ASIDE_WIDTH_RATIO = 0.34   // ページ幅に対し、この比率以下の幅しかないカラムは「サイド注釈」候補
+
+// フォントサイズ・位置による注釈スコアリングのしきい値
+const FONT_SMALL_RATIO  = 0.82   // 本文中央値フォントサイズに対しこの比率以下 → 小さい文字とみなす
+const FONT_TINY_RATIO   = 0.68   // さらにこの比率以下 → 非常に小さい文字（脚注など）
+const ASIDE_SCORE_THRESH = 2     // このスコア以上で注釈と判定
+const PARA_GAP_RATIO    = 1.55   // 中央行間隔のこの倍率以上の空きを段落区切りとみなす
+
+// ページ内のフォントサイズ中央値を求める（変換行列[0]がフォントサイズに相当）
+function getMedianFontSize(items) {
+  const sizes = items
+    .map(it => Math.abs(it.transform[0]))  // transform[0] = scaleX ≈ font size
+    .filter(s => s > 0)
+    .sort((a, b) => a - b)
+  if (!sizes.length) return 12
+  return sizes[Math.floor(sizes.length / 2)]
+}
+
+// 各アイテムに注釈スコアを付与する
+// スコア = 複数の指標の合算（しきい値以上で注釈）
+// ・小さいフォント：+1、非常に小さいフォント：+2
+// ・狭いカラム（幅34%以下）：+2
+// ・ページ左端10%または右端10%の細い帯：+1
+function scoreAsideItem(it, col, pageWidth, medianFont) {
+  let score = 0
+  const fontSize = Math.abs(it.transform[0])
+  if (fontSize > 0 && medianFont > 0) {
+    const ratio = fontSize / medianFont
+    if (ratio <= FONT_TINY_RATIO)  score += 2
+    else if (ratio <= FONT_SMALL_RATIO) score += 1
+  }
+  if (col.contentWidth / pageWidth <= ASIDE_WIDTH_RATIO) score += 2
+  const cx = it.transform[4] + (it.width || 0) / 2
+  if (cx < pageWidth * 0.10 || cx > pageWidth * 0.90) score += 1
+  return score
+}
 
 async function extractTextFromPDF(file, onProgress) {
   const lib = await getPdfJs()
@@ -333,7 +370,7 @@ async function extractTextFromPDF(file, onProgress) {
 
   const pageCount = pdf.numPages
   let fullText = ''
-  // レイアウト由来の暫定分類が付いた文の配列 { text, isAside }
+  // レイアウト由来の暫定分類が付いた文の配列 { text, isAside, asideScore }
   const layoutSentences = []
 
   for (let p = 1; p <= pageCount; p++) {
@@ -345,6 +382,9 @@ async function extractTextFromPDF(file, onProgress) {
 
     const items = tc.items.filter(it => 'str' in it && it.str.trim())
     if (!items.length) continue
+
+    // ── ページ全体のフォントサイズ中央値を計算（注釈判定の基準） ──
+    const medianFont = getMedianFontSize(items)
 
     // ── カラム検出: x座標のヒストグラムから縦方向の空白帯（ギャップ）を見つける ──
     const columns = detectColumns(items, pageWidth)
@@ -363,29 +403,53 @@ async function extractTextFromPDF(file, onProgress) {
         })
       if (!colItems.length) continue
 
-      const lines = []
+      // ── 行単位でアイテムをグループ化し、行ごとの注釈スコア・y座標を記録 ──
+      const lineGroups = []  // { text, asideScore, y, paraBreakBefore? }
       let cur = [], lastY = null
       for (const it of colItems) {
         const y = Math.round(it.transform[5])
         if (lastY !== null && Math.abs(y - lastY) > 4) {
-          if (cur.length) { lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim()); cur = [] }
+          if (cur.length) {
+            const lineText  = cur.map(x => x.str).join(' ').replace(/\s+/g, ' ').trim()
+            const lineScore = cur.reduce((s, x) => s + scoreAsideItem(x, col, pageWidth, medianFont), 0)
+            lineGroups.push({ text: lineText, asideScore: lineScore / cur.length, y: lastY })
+            cur = []
+          }
         }
         cur.push(it); lastY = y
       }
-      if (cur.length) lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim())
+      if (cur.length) {
+        const lineText  = cur.map(x => x.str).join(' ').replace(/\s+/g, ' ').trim()
+        const lineScore = cur.reduce((s, x) => s + scoreAsideItem(x, col, pageWidth, medianFont), 0)
+        lineGroups.push({ text: lineText, asideScore: lineScore / cur.length, y: lastY })
+      }
 
-      const colText = lines.filter(Boolean).join('\n')
+      // ── 行間ギャップから段落区切りを検出 ──
+      // 通常の行間隔の中央値を求め、それより PARA_GAP_RATIO 倍以上広い箇所を段落区切りとみなす
+      if (lineGroups.length >= 2) {
+        const gaps = []
+        for (let li = 1; li < lineGroups.length; li++) {
+          gaps.push(Math.abs(lineGroups[li - 1].y - lineGroups[li].y))
+        }
+        gaps.sort((a, b) => a - b)
+        const medianGap = gaps[Math.floor(gaps.length / 2)] || 0
+        for (let li = 1; li < lineGroups.length; li++) {
+          const gap = Math.abs(lineGroups[li - 1].y - lineGroups[li].y)
+          lineGroups[li].paraBreakBefore = medianGap > 0 && gap > medianGap * PARA_GAP_RATIO
+        }
+      }
+
+      const colText = lineGroups.map(l => l.text).filter(Boolean).join('\n')
       fullText += colText + '\n\n'
 
-      // このカラムが「狭いカラム」かどうかでサイド注釈候補かを暫定判定
-      // （クリック領域として広げたwidthではなく、実際の文字幅contentWidthで判定）
-      const isAsideCol = col.contentWidth / pageWidth <= ASIDE_WIDTH_RATIO
-      const colSentences = splitSentences(colText)
-      for (let si = 0; si < colSentences.length; si++) {
+      // 文分割し、その文を構成する行のスコア平均・段落区切りフラグで注釈か判定
+      const colSentences = splitSentencesWithLines(lineGroups)
+      for (const s of colSentences) {
         layoutSentences.push({
-          text: colSentences[si].text,
-          isAside: isAsideCol,
-          paraStart: colSentences[si].paraStart,  // この文が段落の最初かどうか
+          text: s.text,
+          isAside: s.avgScore >= ASIDE_SCORE_THRESH,
+          asideScore: s.avgScore,
+          paraStart: s.paraStart,
         })
       }
     }
@@ -423,6 +487,37 @@ function detectColumns(items, pageWidth) {
   return columns
 }
 
+// 行グループ配列から文を分割し、各文の注釈スコア平均を付与する
+function splitSentencesWithLines(lineGroups) {
+  const result = []
+  // まず全行テキストを段落ごとに結合してから splitSentences と同様に分割する
+  // ただし行ごとのスコアも保持する必要があるので、文字インデックスで対応する
+  let accumulated = ''   // 現在処理中のテキスト
+  let scores = []        // accumulated の各行に対応するスコア配列
+  let paraStart = true
+
+  const flush = () => {
+    if (!accumulated.trim()) { accumulated = ''; scores = []; paraStart = true; return }
+    const sents = splitSentences(accumulated)
+    // 各文のスコアは accumulated 全体のスコア平均（行ごとに厳密追跡するより十分）
+    const avgScore = scores.length ? scores.reduce((a, b) => a + b, 0) / scores.length : 0
+    sents.forEach((s, si) => {
+      result.push({ text: s.text, avgScore, paraStart: si === 0 && paraStart })
+    })
+    accumulated = ''; scores = []; paraStart = false
+  }
+
+  for (const line of lineGroups) {
+    if (!line.text.trim()) { flush(); paraStart = true; continue }
+    // paraBreakBefore フラグ（行間ギャップ検出）があれば段落を区切る
+    if (line.paraBreakBefore) flush()
+    accumulated += (accumulated ? '\n' : '') + line.text
+    scores.push(line.asideScore)
+  }
+  flush()
+  return result
+}
+
 function splitSentences(text) {
   const result = []
   const paras = text.split(/\n{2,}/)
@@ -436,7 +531,9 @@ function splitSentences(text) {
       '.\n'
     )
     s = s.replace(/([!?])[ \t]+(?=[A-Z\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF])/g, '$1\n')
-    const parts = s.split('\n')
+    // 見出し行（30字以下で句読点なし）の後にある行は新しい段落扱いにする
+    s = s.replace(/^(.{1,30})(?<![。！？.!?])\n(?=[^\n])/gm, '$1\n\n')
+    const parts = s.split(/\n+/)
       .map(x => x.trim())
       .filter(x => x.length >= 4 && !/^[\d\s.]+$/.test(x))
     parts.forEach((text, pi) => {
@@ -498,6 +595,26 @@ const MAX_CHARS = 12000
 // 文番号付きテキストとして送る際、1文あたり何文字までを目安にするか（API送信量の目安）
 const MAX_SENT_CHARS = 8000
 
+// 段落リストを構築（AIへのタイトル生成依頼用）
+// 各段落の先頭文インデックスと、段落テキストの先頭プレビューを返す
+function buildParaList(sentenceObjs) {
+  const paras = []
+  let cur = null
+  sentenceObjs.forEach((s, i) => {
+    if (s.paraStart || cur === null) {
+      cur = { firstIdx: i, texts: [] }
+      paras.push(cur)
+    }
+    if (s.type !== 'annotation') cur.texts.push(s.text)
+  })
+  return paras
+    .filter(p => p.texts.length > 0)
+    .map(p => ({
+      firstIdx: p.firstIdx,
+      preview: p.texts.join(' ').slice(0, 120),
+    }))
+}
+
 async function fetchTermDictionary(sentenceObjs, fullText, apiKey) {
   const modeStr = currentMode === 'definition'
     ? '簡潔な定義重視（各用語を1〜2文で正確に定義してください）'
@@ -509,17 +626,28 @@ async function fetchTermDictionary(sentenceObjs, fullText, apiKey) {
     : fullText
 
   // 番号付きリストとして文を渡す（本文/注釈分類用）。長すぎる場合は先頭から切り詰め
-  let numberedLines = sentenceObjs.map((s, i) => `${i}: ${s.text}`).join('\n')
+  // スコアも付与して AIの判断精度を上げる（score>=2は注釈の可能性が高い）
+  let numberedLines = sentenceObjs.map((s, i) => {
+    const scoreHint = s.asideScore != null
+      ? ` [layout_score:${s.asideScore.toFixed(1)}]`  // 2以上で注釈候補
+      : ''
+    return `${i}${scoreHint}: ${s.text}`
+  }).join('\n')
   if (numberedLines.length > MAX_SENT_CHARS) {
     numberedLines = numberedLines.slice(0, MAX_SENT_CHARS) + '\n…（以下省略）'
   }
 
   const sys = `あなたは専門教材の解説補助AIです。与えられたテキストを読み、以下の3つのタスクを同時に行ってください。
 タスク1: 重要な専門用語を10〜30語程度抽出し、指定されたモード（${modeStr}）に応じて各用語の解説を生成する。ハルシネーション抑制のため、テキストに存在しない用語の創作は厳禁です。
-タスク2: 番号付きの文リストを読み、各文が「本文（主たる論理展開）」か「注釈（サイドバーのワンポイント解説・脚注・図表キャプション内の補足・手書きメモなど、本筋から外れた補足情報）」かを判定し、注釈と判定した文の番号のみを配列で返す。
+タスク2: 番号付きの文リストを読み、各文が「本文（主たる論理展開）」か「注釈（サイドバーのワンポイント解説・脚注・図表キャプション内の補足・手書きメモなど、本筋から外れた補足情報）」かを判定し、注釈と判定した文の番号のみを配列で返す。各文には[layout_score:X.X]というヒントが付いている場合がある。これはPDFのレイアウト解析によるスコアで、2.0以上は注釈の可能性が高い（フォントが小さい・カラムが狭い・ページ端に位置するなど）。ただしこのスコアはあくまでヒントであり、テキストの内容・文脈も考慮して最終判断すること。
 タスク3: 番号付きの文リストを読み、PDFのテキスト抽出時に生じた「欠損・破損」のある文を識別し、前後の文脈から自然な日本語に修復する。欠損の典型例: 文が途中で唐突に終わっている、文字化け記号が含まれる、前後の文脈と意味がつながらない断片、単語が不自然に切れている。欠損が明確な文のみ対象とし、不確実な場合は修復しない。修復した場合のみ repairs 配列に含める（正常な文は含めない）。
+タスク4: 以下の段落リストを読み、各段落の内容を表す短いタイトル（10字以内）を生成する。タイトルは簡潔で内容を的確に表すこと。段落リストは別途 usr メッセージに含まれる。
 レスポンスはJSONオブジェクトのみとし、前後の説明・マークダウンコードブロックは一切不要です。`
-  const usr = `■専門用語抽出用テキスト:\n${text}\n\n■本文/注釈分類・欠損検出用の番号付き文リスト:\n${numberedLines}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"terms":{"専門用語1":"解説文1","専門用語2":"解説文2"},"annotationIndices":[番号, ...],"repairs":[{"index":番号,"repaired":"修復後のテキスト"},...]}`
+  // 段落リストを構築（先頭文インデックス + 段落テキスト先頭100字）
+  const paraList = buildParaList(sentenceObjs)
+  const paraListStr = paraList.map(p => `para_${p.firstIdx}: ${p.preview}`).join('\n')
+
+  const usr = `■専門用語抽出用テキスト:\n${text}\n\n■本文/注釈分類・欠損検出用の番号付き文リスト:\n${numberedLines}\n\n■段落リスト（タイトル生成用）:\n${paraListStr}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"terms":{"専門用語1":"解説文1","専門用語2":"解説文2"},"annotationIndices":[番号, ...],"repairs":[{"index":番号,"repaired":"修復後のテキスト"},...], "paraTitles":{"para_先頭文番号":"タイトル（10字以内）",...}}`
 
   const ctrl = new AbortController()
   fetchAbortCtrl = ctrl
@@ -580,9 +708,12 @@ function parseTermDictionaryResponse(clean) {
     const repairs = Array.isArray(parsed.repairs)
       ? parsed.repairs.filter(r => Number.isInteger(r?.index) && typeof r?.repaired === 'string' && r.repaired.trim())
       : null
-    return { terms: parsed.terms, annotationIndices, repairs }
+    const paraTitles = parsed.paraTitles && typeof parsed.paraTitles === 'object'
+      ? parsed.paraTitles
+      : {}
+    return { terms: parsed.terms, annotationIndices, repairs, paraTitles }
   }
-  return { terms: parsed, annotationIndices: null, repairs: null }
+  return { terms: parsed, annotationIndices: null, repairs: null, paraTitles: {} }
 }
 
 async function runLoop(resumeFrom = 0) {
@@ -853,6 +984,16 @@ function renderTextPanel() {
     const paraEl = document.createElement('p')
     paraEl.className = 'para-block'
 
+    // 段落タイトルがあれば先頭に表示
+    const firstIdx = group[0]?.i
+    const titleText = paraTitles[firstIdx]
+    if (titleText) {
+      const titleEl = document.createElement('div')
+      titleEl.className = 'para-title'
+      titleEl.textContent = titleText
+      paraEl.appendChild(titleEl)
+    }
+
     for (const { item, i } of group) {
       const span = document.createElement('span')
       let cls = 'sentence'
@@ -1073,8 +1214,13 @@ window.rebuildDictionary = async function() {
   // Re-assemble fullText from sentences for rebuild
   const fullText = sentences.map(s => s.text).join('\n')
   try {
-    const { terms, annotationIndices, repairs } = await fetchTermDictionary(sentences, fullText, apiKey)
+    const { terms, annotationIndices, repairs, paraTitles: aiTitles } = await fetchTermDictionary(sentences, fullText, apiKey)
     termDictionary = terms
+    paraTitles = {}
+    for (const [key, title] of Object.entries(aiTitles)) {
+      const idx = parseInt(key.replace('para_', ''))
+      if (!isNaN(idx)) paraTitles[idx] = title
+    }
     explainedWords = new Set()  // reset so re-explained with new mode
     document.getElementById('words-list').innerHTML = ''
     document.getElementById('words-card').style.display = 'none'
@@ -1190,6 +1336,7 @@ window.resetPDF = async function() {
 function resetWordState() {
   explainedWords = new Set()
   termDictionary = {}
+  paraTitles = {}
   document.getElementById('words-list').innerHTML = ''
   document.getElementById('words-card').style.display = 'none'
   hideExplainCard()
@@ -1281,8 +1428,14 @@ async function processFile(file) {
       addLog('🤖 Gemini APIで専門用語・本文構造を一括抽出中...')
 
       try {
-        const { terms, annotationIndices, repairs } = await fetchTermDictionary(sentences, fullText, apiKey)
+        const { terms, annotationIndices, repairs, paraTitles: aiTitles } = await fetchTermDictionary(sentences, fullText, apiKey)
         termDictionary = terms
+        // 段落タイトルを適用（para_N -> firstIdx N）
+        paraTitles = {}
+        for (const [key, title] of Object.entries(aiTitles)) {
+          const idx = parseInt(key.replace('para_', ''))
+          if (!isNaN(idx)) paraTitles[idx] = title
+        }
         const termCount = Object.keys(termDictionary).length
 
         if (annotationIndices) {
@@ -1321,7 +1474,8 @@ async function processFile(file) {
       }
     } else {
       const asideCount = sentences.filter(s => s.type === 'annotation').length
-      if (asideCount > 0) addLog(`📐 レイアウト判定で注釈候補${asideCount}件を検出（簡易判定）`)
+      const scoreCount = sentences.filter(s => s.asideScore != null && s.asideScore >= ASIDE_SCORE_THRESH).length
+      if (asideCount > 0) addLog(`📐 レイアウト判定: 注釈候補${asideCount}件（スコアベース）`)
     }
 
     // ── UI切り替え ───────────────────────────────────────────────────────

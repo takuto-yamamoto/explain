@@ -54,6 +54,10 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 .sentence.paused{background:rgba(37,99,235,0.08);color:#1D4ED8}
 .sentence.reading{color:#1D4ED8;animation:readPulse 1.2s ease-in-out infinite}
 .sentence.explaining{color:#92400E;animation:explainPulse 1s ease-in-out infinite}
+.sentence.annotation{color:#B0B8C4;font-size:12.5px}
+.sentence.annotation:hover{background:rgba(148,163,184,0.12);color:#64748B}
+.sentence.annotation::before{content:'註 ';font-size:9px;color:#CBD5E1;vertical-align:super}
+.sentence.skipping{background:rgba(148,163,184,0.25);transition:background .15s}
 #progress-bar-fill{height:2px;border-radius:2px;transition:width .5s ease,background .3s}
 #explain-card{border-radius:16px;padding:16px;background:rgba(255,251,235,0.9);border:1px solid rgba(217,119,6,0.25);box-shadow:0 2px 8px rgba(217,119,6,0.08)}
 .word-tag{display:inline-block;font-size:11px;padding:4px 9px;border-radius:8px;background:#EFF6FF;color:#3B82F6;border:1px solid rgba(37,99,235,0.18);margin:2px}
@@ -192,6 +196,13 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
               oninput="setRate(this.value)" />
             <span id="rate-label" style="font-size:11px;font-family:var(--font-mono);color:var(--blue);min-width:28px;text-align:right">1.0×</span>
           </div>
+          <label style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 2px;cursor:pointer">
+            <span style="font-size:11px;color:var(--muted)">サイド注釈・脚注をスキップ</span>
+            <input type="checkbox" id="skip-annotations-toggle" checked
+              style="accent-color:var(--blue);cursor:pointer;width:15px;height:15px"
+              onchange="setSkipAnnotations(this.checked)" />
+          </label>
+          <div id="annotation-count-hint" style="display:none;font-size:10px;color:var(--dim);padding:0 2px;margin-top:-4px"></div>
         </div>
       </div>
 
@@ -266,6 +277,7 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 
 <script type="module">
 // ── STATE ──────────────────────────────────────────────────────────────────
+// sentences の各要素: { text: string, type: 'body' | 'annotation', source: 'layout' | 'ai' }
 let sentences    = []
 let currentMode  = 'definition'
 let currentRate  = 1.0
@@ -280,6 +292,7 @@ let pdfjsLib     = null
 // 一括抽出した用語辞書 { "専門用語": "解説文", ... }
 let termDictionary = {}
 let selectedVoice  = null   // SpeechSynthesisVoice | null
+let skipAnnotations = true  // 注釈（サイド注釈・脚注など）の読み上げをスキップするか
 
 // ── PDF.JS LOADER ──────────────────────────────────────────────────────────
 // We import dynamically to avoid the <script type="module"> tag conflicting
@@ -293,6 +306,10 @@ async function getPdfJs() {
   return mod
 }
 
+// カラム（段組み）検出のしきい値
+const COLUMN_GAP_RATIO = 0.06   // ページ幅に対し、この比率以上の空白ギャップでカラム境界とみなす
+const ASIDE_WIDTH_RATIO = 0.34  // ページ幅に対し、この比率以下の幅しかないカラムは「サイド注釈」候補とみなす
+
 async function extractTextFromPDF(file, onProgress) {
   const lib = await getPdfJs()
   const buf = await file.arrayBuffer()
@@ -304,34 +321,88 @@ async function extractTextFromPDF(file, onProgress) {
 
   const pageCount = pdf.numPages
   let fullText = ''
+  // レイアウト由来の暫定分類が付いた文の配列 { text, isAside }
+  const layoutSentences = []
 
   for (let p = 1; p <= pageCount; p++) {
     onProgress?.(p, pageCount)
     const page = await pdf.getPage(p)
     const tc   = await page.getTextContent()
+    const viewport = page.getViewport({ scale: 1 })
+    const pageWidth = viewport.width || 1
 
-    // Sort items top-to-bottom (PDF y-axis is inverted), then left-to-right
-    const items = tc.items
-      .filter(it => 'str' in it && it.str.trim())
-      .sort((a, b) => {
-        const dy = b.transform[5] - a.transform[5]
-        if (Math.abs(dy) > 4) return dy
-        return a.transform[4] - b.transform[4]
-      })
+    const items = tc.items.filter(it => 'str' in it && it.str.trim())
+    if (!items.length) continue
 
-    const lines = []
-    let cur = [], lastY = null
-    for (const it of items) {
-      const y = Math.round(it.transform[5])
-      if (lastY !== null && Math.abs(y - lastY) > 4) {
-        if (cur.length) { lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim()); cur = [] }
+    // ── カラム検出: x座標のヒストグラムから縦方向の空白帯（ギャップ）を見つける ──
+    const columns = detectColumns(items, pageWidth)
+
+    // 各テキストアイテムをカラムに割り当て、カラムごとに行を再構成
+    for (const col of columns) {
+      const colItems = items
+        .filter(it => {
+          const cx = it.transform[4] + (it.width || 0) / 2
+          return cx >= col.x0 && cx < col.x1
+        })
+        .sort((a, b) => {
+          const dy = b.transform[5] - a.transform[5]
+          if (Math.abs(dy) > 4) return dy
+          return a.transform[4] - b.transform[4]
+        })
+      if (!colItems.length) continue
+
+      const lines = []
+      let cur = [], lastY = null
+      for (const it of colItems) {
+        const y = Math.round(it.transform[5])
+        if (lastY !== null && Math.abs(y - lastY) > 4) {
+          if (cur.length) { lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim()); cur = [] }
+        }
+        cur.push(it); lastY = y
       }
-      cur.push(it); lastY = y
+      if (cur.length) lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim())
+
+      const colText = lines.filter(Boolean).join('\n')
+      fullText += colText + '\n\n'
+
+      // このカラムが「狭いカラム」かどうかでサイド注釈候補かを暫定判定
+      // （クリック領域として広げたwidthではなく、実際の文字幅contentWidthで判定）
+      const isAsideCol = col.contentWidth / pageWidth <= ASIDE_WIDTH_RATIO
+      const colSentences = splitSentences(colText)
+      for (const s of colSentences) layoutSentences.push({ text: s, isAside: isAsideCol })
     }
-    if (cur.length) lines.push(cur.map(x => x.str).join(' ').replace(/\s+/g,' ').trim())
-    fullText += lines.filter(Boolean).join('\n') + '\n\n'
   }
-  return { sentences: splitSentences(fullText), fullText, pageCount }
+  return { sentences: layoutSentences, fullText, pageCount }
+}
+
+// x座標の被覆区間から「縦の空白帯」を検出してカラムに分割する簡易ロジック
+// クリック領域・行再構成には中間点まで広げた範囲(x0〜x1)を使うが、
+// 「狭いカラムか」の判定には実際に文字が存在する幅(contentWidth)を使う
+// （中間点まで広げると余白がカラムの見かけ幅を太らせてしまうため）
+function detectColumns(items, pageWidth) {
+  const spans = items
+    .map(it => ({ x0: it.transform[4], x1: it.transform[4] + (it.width || 0) }))
+    .sort((a, b) => a.x0 - b.x0)
+  if (!spans.length) return [{ x0: 0, x1: pageWidth, width: pageWidth, contentWidth: pageWidth }]
+
+  // 被覆区間をマージして「文字が存在するx範囲」の塊を求める
+  const merged = [spans[0]]
+  for (const s of spans.slice(1)) {
+    const last = merged[merged.length - 1]
+    if (s.x0 - last.x1 > pageWidth * COLUMN_GAP_RATIO) {
+      merged.push({ ...s })
+    } else {
+      last.x1 = Math.max(last.x1, s.x1)
+    }
+  }
+
+  // ギャップで仕切られた塊をそのままカラムとする（境界は塊の中間点）
+  const columns = merged.map((m, i) => {
+    const x0 = i === 0 ? 0 : (merged[i - 1].x1 + m.x0) / 2
+    const x1 = i === merged.length - 1 ? pageWidth : (m.x1 + merged[i + 1].x0) / 2
+    return { x0, x1, width: x1 - x0, contentWidth: m.x1 - m.x0 }
+  })
+  return columns
 }
 
 function splitSentences(text) {
@@ -399,23 +470,34 @@ function speakText(text, rate = 1.0) {
   })
 }
 
-// ── 一括用語抽出 ────────────────────────────────────────────────────────────
-// テキスト全体を1回のAPI呼び出しで分析し、用語辞書を構築する
-// 長すぎる場合は MAX_CHARS で切り詰めてから送信
+// ── 一括用語抽出 + 本文/注釈分類 ─────────────────────────────────────────────
+// テキスト全体を1回のAPI呼び出しで分析し、用語辞書と「注釈文インデックス」を
+// 同時に構築する（呼び出し回数を増やさず無料枠を節約するため）
 const MAX_CHARS = 12000
+// 文番号付きテキストとして送る際、1文あたり何文字までを目安にするか（API送信量の目安）
+const MAX_SENT_CHARS = 8000
 
-async function fetchTermDictionary(fullText, apiKey) {
+async function fetchTermDictionary(sentenceObjs, fullText, apiKey) {
   const modeStr = currentMode === 'definition'
     ? '簡潔な定義重視（各用語を1〜2文で正確に定義してください）'
     : '直感的な例え話重視（各用語を身近な例えを使って2文以内で説明してください）'
 
-  // テキストが長すぎる場合は先頭から切り出す
+  // テキストが長すぎる場合は先頭から切り出す（用語抽出用）
   const text = fullText.length > MAX_CHARS
     ? fullText.slice(0, MAX_CHARS) + '\n…（以下省略）'
     : fullText
 
-  const sys = `あなたは専門教材の解説補助AIです。与えられたテキスト全体を読み、重要な専門用語を10〜30語程度抽出し、指定されたモード（${modeStr}）に応じて各用語の解説を生成してください。ハルシネーション抑制のため、テキストに存在しない用語の創作は厳禁です。レスポンスはJSONオブジェクトのみとし、前後の説明・マークダウンコードブロックは一切不要です。`
-  const usr = `以下のテキストを読み、重要な専門用語とその解説をまとめて抽出してください。\n\nテキスト:\n${text}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"専門用語1":"解説文1","専門用語2":"解説文2",...}`
+  // 番号付きリストとして文を渡す（本文/注釈分類用）。長すぎる場合は先頭から切り詰め
+  let numberedLines = sentenceObjs.map((s, i) => `${i}: ${s.text}`).join('\n')
+  if (numberedLines.length > MAX_SENT_CHARS) {
+    numberedLines = numberedLines.slice(0, MAX_SENT_CHARS) + '\n…（以下省略）'
+  }
+
+  const sys = `あなたは専門教材の解説補助AIです。与えられたテキストを読み、以下の2つのタスクを同時に行ってください。
+タスク1: 重要な専門用語を10〜30語程度抽出し、指定されたモード（${modeStr}）に応じて各用語の解説を生成する。ハルシネーション抑制のため、テキストに存在しない用語の創作は厳禁です。
+タスク2: 番号付きの文リストを読み、各文が「本文（主たる論理展開）」か「注釈（サイドバーのワンポイント解説・脚注・図表キャプション内の補足・手書きメモなど、本筋から外れた補足情報）」かを判定し、注釈と判定した文の番号のみを配列で返す。
+レスポンスはJSONオブジェクトのみとし、前後の説明・マークダウンコードブロックは一切不要です。`
+  const usr = `■専門用語抽出用テキスト:\n${text}\n\n■本文/注釈分類用の番号付き文リスト:\n${numberedLines}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"terms":{"専門用語1":"解説文1","専門用語2":"解説文2"},"annotationIndices":[番号, 番号, ...]}`
 
   const ctrl = new AbortController()
   fetchAbortCtrl = ctrl
@@ -448,20 +530,34 @@ async function fetchTermDictionary(fullText, apiKey) {
     const raw   = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '{}'
     const clean = raw.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim()
 
-    try { return JSON.parse(clean) }
-    catch {
-      // JSONブロックだけ取り出して再試行
-      const m = clean.match(/\{[\s\S]*\}/)
-      if (m) try { return JSON.parse(m[0]) } catch { /* fall through */ }
-      return {}
-    }
+    return parseTermDictionaryResponse(clean)
   } catch (e) {
-    if (e.name === 'AbortError') return {}
+    if (e.name === 'AbortError') return { terms: {}, annotationIndices: null }
     throw e  // 呼び出し元でハンドリング
   } finally {
     clearInterval(poll)
     fetchAbortCtrl = null
   }
+}
+
+function parseTermDictionaryResponse(clean) {
+  let parsed
+  try { parsed = JSON.parse(clean) }
+  catch {
+    const m = clean.match(/\{[\s\S]*\}/)
+    if (m) { try { parsed = JSON.parse(m[0]) } catch { parsed = null } }
+  }
+  if (!parsed || typeof parsed !== 'object') return { terms: {}, annotationIndices: null }
+
+  // 新形式 { terms, annotationIndices } を期待するが、
+  // 万一フラットな旧形式 { 用語: 解説, ... } が返ってきた場合のフォールバックも用意
+  if (parsed.terms && typeof parsed.terms === 'object') {
+    const annotationIndices = Array.isArray(parsed.annotationIndices)
+      ? parsed.annotationIndices.filter(n => Number.isInteger(n))
+      : null
+    return { terms: parsed.terms, annotationIndices }
+  }
+  return { terms: parsed, annotationIndices: null }
 }
 
 async function runLoop(resumeFrom = 0) {
@@ -473,8 +569,15 @@ async function runLoop(resumeFrom = 0) {
   try {
     for (let i = resumeFrom; i < sentences.length; i++) {
       if (abortFlag) break
-      const sentence = sentences[i]
+      const item = sentences[i]
+      const sentence = item.text
       if (!sentence.trim()) continue
+
+      // 注釈と判定された文は、設定がONならスキップ（読み上げず一瞬だけハイライトして通過）
+      if (item.type === 'annotation' && skipAnnotations) {
+        highlightSentence(i, true)
+        continue
+      }
 
       setSpeechState('reading')
       highlightSentence(i)
@@ -569,13 +672,13 @@ function setSpeechState(s) {
       : 'linear-gradient(90deg,#1D4ED8,#60A5FA)'
 }
 
-function highlightSentence(idx) {
+function highlightSentence(idx, isSkipping = false) {
   currentIdx = idx
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
-    el.classList.remove('reading', 'explaining', 'paused')
+    el.classList.remove('reading', 'explaining', 'paused', 'skipping')
     if (parseInt(el.dataset.idx) === idx) {
       // Always set 'reading' here; showExplainCard will switch to 'explaining' when needed
-      el.classList.add('reading')
+      el.classList.add(isSkipping ? 'skipping' : 'reading')
       el.scrollIntoView({ behavior: 'smooth', block: 'center' })
     }
   })
@@ -694,16 +797,19 @@ function renderTextPanel() {
   const panel = document.getElementById('text-panel')
   panel.innerHTML = ''
   const frag = document.createDocumentFragment()
-  sentences.forEach((s, i) => {
+  sentences.forEach((item, i) => {
     const span = document.createElement('span')
-    span.className   = 'sentence'
+    span.className   = item.type === 'annotation' ? 'sentence annotation' : 'sentence'
     span.dataset.idx = i
-    span.textContent = s + ' '
-    span.title = 'クリックしてここから開始'
+    span.textContent = item.text + ' '
+    span.title = item.type === 'annotation'
+      ? 'クリックしてここから開始（注釈と判定された文）'
+      : 'クリックしてここから開始'
     span.addEventListener('click', () => seekTo(i))
     frag.appendChild(span)
   })
   panel.appendChild(frag)
+  updateAnnotationHint()
 }
 
 async function seekTo(idx) {
@@ -743,6 +849,23 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') window.close
 window.setRate = function(v) {
   currentRate = parseFloat(v)
   document.getElementById('rate-label').textContent = currentRate.toFixed(1) + '×'
+}
+
+window.setSkipAnnotations = function(checked) {
+  skipAnnotations = checked
+  addLog(checked ? '🔇 注釈の読み上げをスキップします' : '🔊 注釈も読み上げます')
+}
+
+function updateAnnotationHint() {
+  const hint = document.getElementById('annotation-count-hint')
+  if (!hint) return
+  const count = sentences.filter(s => s.type === 'annotation').length
+  if (count > 0) {
+    hint.textContent = `注釈と判定された文: ${count} / ${sentences.length}文`
+    hint.style.display = 'block'
+  } else {
+    hint.style.display = 'none'
+  }
 }
 
 // ── VOICE SELECTOR ─────────────────────────────────────────────────────────
@@ -860,12 +983,24 @@ window.rebuildDictionary = async function() {
 
   addLog('🔄 用語辞書を再生成中...')
   // Re-assemble fullText from sentences for rebuild
-  const fullText = sentences.join('\n')
+  const fullText = sentences.map(s => s.text).join('\n')
   try {
-    termDictionary = await fetchTermDictionary(fullText, apiKey)
+    const { terms, annotationIndices } = await fetchTermDictionary(sentences, fullText, apiKey)
+    termDictionary = terms
     explainedWords = new Set()  // reset so re-explained with new mode
     document.getElementById('words-list').innerHTML = ''
     document.getElementById('words-card').style.display = 'none'
+
+    if (annotationIndices) {
+      // 注釈分類は用語モードに左右されない判定なので、再生成時も上書き反映する
+      sentences.forEach(s => { if (s.source === 'ai') { s.type = 'body'; s.source = 'layout' } })
+      let aiCount = 0
+      for (const idx of annotationIndices) {
+        if (sentences[idx]) { sentences[idx].type = 'annotation'; sentences[idx].source = 'ai'; aiCount++ }
+      }
+      renderTextPanel()
+    }
+
     const termCount = Object.keys(termDictionary).length
     addLog(`📚 用語辞書再構築完了: ${termCount}語`)
   } catch (e) {
@@ -939,6 +1074,7 @@ window.resetPDF = async function() {
   document.getElementById('prog-label').textContent = '0 / 0 文'
   document.getElementById('prog-pct').textContent = '0%'
   document.getElementById('file-input').value = ''
+  document.getElementById('annotation-count-hint').style.display = 'none'
   clearLog()
   resetWordState()
   resetDropZone()
@@ -1016,26 +1152,53 @@ async function processFile(file) {
       resetDropZone(); return
     }
 
-    sentences = parsed
+    // レイアウト由来の暫定判定を type/source 付きの正式な形に変換
+    // （狭いカラム = サイド注釈の可能性が高い、という簡易ヒューリスティック）
+    sentences = parsed.map(s => ({
+      text: s.text,
+      type: s.isAside ? 'annotation' : 'body',
+      source: 'layout',
+    }))
     renderTextPanel()
 
     // ── フェーズ2: AI一括分析（APIキーがある場合のみ） ──────────────────
+    // 用語辞書の生成と「本文/注釈」分類を同じ1回のAPI呼び出しにまとめることで
+    // 無料枠の消費を抑える（呼び出し回数を増やさない）
     const apiKey = document.getElementById('api-key').value.trim()
     termDictionary = {}  // 前回分をリセット
 
     if (apiKey) {
       document.getElementById('drop-prog-fill').style.width  = '100%'
-      document.getElementById('drop-prog-label').textContent = 'AIが専門用語を分析中...'
-      addLog('🤖 Gemini APIで専門用語を一括抽出中...')
+      document.getElementById('drop-prog-label').textContent = 'AIが専門用語と本文構造を分析中...'
+      addLog('🤖 Gemini APIで専門用語・本文構造を一括抽出中...')
 
       try {
-        termDictionary = await fetchTermDictionary(fullText, apiKey)
+        const { terms, annotationIndices } = await fetchTermDictionary(sentences, fullText, apiKey)
+        termDictionary = terms
         const termCount = Object.keys(termDictionary).length
-        addLog(`📚 用語辞書構築完了: ${termCount}語を抽出`)
+
+        if (annotationIndices) {
+          // AIの判定で上書き（レイアウト判定より精度が高い）
+          let aiCount = 0
+          for (const idx of annotationIndices) {
+            if (sentences[idx]) {
+              sentences[idx].type = 'annotation'
+              sentences[idx].source = 'ai'
+              aiCount++
+            }
+          }
+          renderTextPanel()
+          addLog(`📚 用語辞書構築完了: ${termCount}語を抽出 / 注釈${aiCount}件をAI判定`)
+        } else {
+          addLog(`📚 用語辞書構築完了: ${termCount}語を抽出`)
+        }
       } catch (e) {
         showAlert('AI解析エラー: ' + e.message, 'warn')
         addLog('⚠ 用語抽出に失敗（TTS読み上げのみで続行）')
       }
+    } else {
+      const asideCount = sentences.filter(s => s.type === 'annotation').length
+      if (asideCount > 0) addLog(`📐 レイアウト判定で注釈候補${asideCount}件を検出（簡易判定）`)
     }
 
     // ── UI切り替え ───────────────────────────────────────────────────────

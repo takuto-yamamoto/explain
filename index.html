@@ -48,16 +48,25 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 #drop-zone.drag-over{border-color:rgba(37,99,235,0.5);background:rgba(219,234,254,0.4)}
 #drop-zone:hover{border-color:rgba(37,99,235,0.35);background:rgba(239,246,255,0.8)}
 .drop-icon{width:64px;height:64px;border-radius:16px;background:rgba(37,99,235,0.1);border:1px solid rgba(37,99,235,0.22);display:flex;align-items:center;justify-content:center;margin-bottom:16px}
-#text-panel{max-height:58vh;min-height:300px;overflow-y:auto;border-radius:16px;padding:20px;background:#FFFFFF;border:1px solid var(--border);line-height:1.9;font-size:14px;box-shadow:0 1px 8px rgba(37,99,235,0.06)}
-.sentence{color:#64748B;transition:color .3s ease,background .15s;border-radius:3px;padding:1px 3px;margin-right:2px;display:inline;cursor:pointer}
+#text-panel{max-height:58vh;min-height:300px;overflow-y:auto;border-radius:16px;padding:20px 24px;background:#FFFFFF;border:1px solid var(--border);font-size:14px;box-shadow:0 1px 8px rgba(37,99,235,0.06)}
+.para-block{margin-bottom:1.4em;line-height:2.0;border-left:3px solid transparent;padding-left:10px;border-radius:0 6px 6px 0;transition:border-color .3s}
+.para-block:last-child{margin-bottom:0}
+.para-block.has-reading{border-left-color:rgba(37,99,235,0.35)}
+.para-block.has-explaining{border-left-color:rgba(217,119,6,0.5)}
+.sentence{color:#64748B;transition:color .25s ease,background .15s,box-shadow .15s;border-radius:4px;padding:2px 4px;margin:1px 1px;display:inline;cursor:pointer}
 .sentence:hover{background:rgba(37,99,235,0.07);color:#1E293B}
-.sentence.paused{background:rgba(37,99,235,0.08);color:#1D4ED8}
-.sentence.reading{color:#1D4ED8;animation:readPulse 1.2s ease-in-out infinite}
-.sentence.explaining{color:#92400E;animation:explainPulse 1s ease-in-out infinite}
+.sentence.paused{background:rgba(37,99,235,0.10);color:#1D4ED8;box-shadow:0 0 0 1px rgba(37,99,235,0.2)}
+.sentence.reading{background:rgba(37,99,235,0.13);color:#1D4ED8;box-shadow:0 0 0 1.5px rgba(37,99,235,0.35);animation:readPulse 1.4s ease-in-out infinite}
+.sentence.explaining{background:rgba(217,119,6,0.14);color:#92400E;box-shadow:0 0 0 1.5px rgba(217,119,6,0.4);animation:explainPulse 1s ease-in-out infinite}
 .sentence.annotation{color:#B0B8C4;font-size:12.5px}
 .sentence.annotation:hover{background:rgba(148,163,184,0.12);color:#64748B}
 .sentence.annotation::before{content:'註 ';font-size:9px;color:#CBD5E1;vertical-align:super}
 .sentence.skipping{background:rgba(148,163,184,0.25);transition:background .15s}
+.sentence.repaired{color:#5B21B6;border-bottom:1.5px dashed rgba(124,58,237,0.4)}
+.sentence.repaired:hover{background:rgba(124,58,237,0.07);color:#4C1D95}
+.sentence.repaired.reading{color:#6D28D9;animation:repairPulse 1.2s ease-in-out infinite}
+.repair-badge{display:inline-flex;align-items:center;gap:3px;font-size:9px;font-weight:600;padding:1px 5px;border-radius:4px;background:rgba(124,58,237,0.1);color:#7C3AED;border:1px solid rgba(124,58,237,0.2);vertical-align:middle;margin-left:3px;letter-spacing:.04em;cursor:help}
+@keyframes repairPulse{0%,100%{background:rgba(124,58,237,0.10)}50%{background:rgba(124,58,237,0.22)}}
 #progress-bar-fill{height:2px;border-radius:2px;transition:width .5s ease,background .3s}
 #explain-card{border-radius:16px;padding:16px;background:rgba(255,251,235,0.9);border:1px solid rgba(217,119,6,0.25);box-shadow:0 2px 8px rgba(217,119,6,0.08)}
 .word-tag{display:inline-block;font-size:11px;padding:4px 9px;border-radius:8px;background:#EFF6FF;color:#3B82F6;border:1px solid rgba(37,99,235,0.18);margin:2px}
@@ -277,7 +286,10 @@ body::before{content:'';position:fixed;inset:0;background-image:linear-gradient(
 
 <script type="module">
 // ── STATE ──────────────────────────────────────────────────────────────────
-// sentences の各要素: { text: string, type: 'body' | 'annotation', source: 'layout' | 'ai' }
+// sentences の各要素:
+//   { text: string, type: 'body' | 'annotation', source: 'layout' | 'ai',
+//     repaired?: true, original?: string }
+//   repaired=true の場合、original に修正前の欠損テキストが入る
 let sentences    = []
 let currentMode  = 'definition'
 let currentRate  = 1.0
@@ -369,7 +381,13 @@ async function extractTextFromPDF(file, onProgress) {
       // （クリック領域として広げたwidthではなく、実際の文字幅contentWidthで判定）
       const isAsideCol = col.contentWidth / pageWidth <= ASIDE_WIDTH_RATIO
       const colSentences = splitSentences(colText)
-      for (const s of colSentences) layoutSentences.push({ text: s, isAside: isAsideCol })
+      for (let si = 0; si < colSentences.length; si++) {
+        layoutSentences.push({
+          text: colSentences[si].text,
+          isAside: isAsideCol,
+          paraStart: colSentences[si].paraStart,  // この文が段落の最初かどうか
+        })
+      }
     }
   }
   return { sentences: layoutSentences, fullText, pageCount }
@@ -407,7 +425,8 @@ function detectColumns(items, pageWidth) {
 
 function splitSentences(text) {
   const result = []
-  for (const para of text.split(/\n{2,}/)) {
+  const paras = text.split(/\n{2,}/)
+  for (const para of paras) {
     if (!para.trim()) continue
     // Split on Japanese sentence-end punctuation
     let s = para.replace(/([。！？])\s*/g, '$1\n')
@@ -420,7 +439,9 @@ function splitSentences(text) {
     const parts = s.split('\n')
       .map(x => x.trim())
       .filter(x => x.length >= 4 && !/^[\d\s.]+$/.test(x))
-    result.push(...parts)
+    parts.forEach((text, pi) => {
+      result.push({ text, paraStart: pi === 0 })
+    })
   }
   return result
 }
@@ -493,11 +514,12 @@ async function fetchTermDictionary(sentenceObjs, fullText, apiKey) {
     numberedLines = numberedLines.slice(0, MAX_SENT_CHARS) + '\n…（以下省略）'
   }
 
-  const sys = `あなたは専門教材の解説補助AIです。与えられたテキストを読み、以下の2つのタスクを同時に行ってください。
+  const sys = `あなたは専門教材の解説補助AIです。与えられたテキストを読み、以下の3つのタスクを同時に行ってください。
 タスク1: 重要な専門用語を10〜30語程度抽出し、指定されたモード（${modeStr}）に応じて各用語の解説を生成する。ハルシネーション抑制のため、テキストに存在しない用語の創作は厳禁です。
 タスク2: 番号付きの文リストを読み、各文が「本文（主たる論理展開）」か「注釈（サイドバーのワンポイント解説・脚注・図表キャプション内の補足・手書きメモなど、本筋から外れた補足情報）」かを判定し、注釈と判定した文の番号のみを配列で返す。
+タスク3: 番号付きの文リストを読み、PDFのテキスト抽出時に生じた「欠損・破損」のある文を識別し、前後の文脈から自然な日本語に修復する。欠損の典型例: 文が途中で唐突に終わっている、文字化け記号が含まれる、前後の文脈と意味がつながらない断片、単語が不自然に切れている。欠損が明確な文のみ対象とし、不確実な場合は修復しない。修復した場合のみ repairs 配列に含める（正常な文は含めない）。
 レスポンスはJSONオブジェクトのみとし、前後の説明・マークダウンコードブロックは一切不要です。`
-  const usr = `■専門用語抽出用テキスト:\n${text}\n\n■本文/注釈分類用の番号付き文リスト:\n${numberedLines}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"terms":{"専門用語1":"解説文1","専門用語2":"解説文2"},"annotationIndices":[番号, 番号, ...]}`
+  const usr = `■専門用語抽出用テキスト:\n${text}\n\n■本文/注釈分類・欠損検出用の番号付き文リスト:\n${numberedLines}\n\nレスポンス形式（JSONオブジェクトのみ、他のテキスト不要）:\n{"terms":{"専門用語1":"解説文1","専門用語2":"解説文2"},"annotationIndices":[番号, ...],"repairs":[{"index":番号,"repaired":"修復後のテキスト"},...]}`
 
   const ctrl = new AbortController()
   fetchAbortCtrl = ctrl
@@ -547,17 +569,20 @@ function parseTermDictionaryResponse(clean) {
     const m = clean.match(/\{[\s\S]*\}/)
     if (m) { try { parsed = JSON.parse(m[0]) } catch { parsed = null } }
   }
-  if (!parsed || typeof parsed !== 'object') return { terms: {}, annotationIndices: null }
+  if (!parsed || typeof parsed !== 'object') return { terms: {}, annotationIndices: null, repairs: null }
 
-  // 新形式 { terms, annotationIndices } を期待するが、
+  // 新形式 { terms, annotationIndices, repairs } を期待するが、
   // 万一フラットな旧形式 { 用語: 解説, ... } が返ってきた場合のフォールバックも用意
   if (parsed.terms && typeof parsed.terms === 'object') {
     const annotationIndices = Array.isArray(parsed.annotationIndices)
       ? parsed.annotationIndices.filter(n => Number.isInteger(n))
       : null
-    return { terms: parsed.terms, annotationIndices }
+    const repairs = Array.isArray(parsed.repairs)
+      ? parsed.repairs.filter(r => Number.isInteger(r?.index) && typeof r?.repaired === 'string' && r.repaired.trim())
+      : null
+    return { terms: parsed.terms, annotationIndices, repairs }
   }
-  return { terms: parsed, annotationIndices: null }
+  return { terms: parsed, annotationIndices: null, repairs: null }
 }
 
 async function runLoop(resumeFrom = 0) {
@@ -620,6 +645,9 @@ async function runLoop(resumeFrom = 0) {
       if (sentences.length > 0) updateProgress(sentences.length - 1, true)
       setSpeechState('idle')
       highlightSentence(-1)
+      document.querySelectorAll('#text-panel .para-block').forEach(el => {
+        el.classList.remove('has-reading', 'has-explaining')
+      })
       hideExplainCard()
       addLog('✅ 読み上げ完了')
     }
@@ -674,12 +702,18 @@ function setSpeechState(s) {
 
 function highlightSentence(idx, isSkipping = false) {
   currentIdx = idx
+  // 全段落ブロックのアクティブクラスをリセット
+  document.querySelectorAll('#text-panel .para-block').forEach(el => {
+    el.classList.remove('has-reading', 'has-explaining')
+  })
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
     el.classList.remove('reading', 'explaining', 'paused', 'skipping')
     if (parseInt(el.dataset.idx) === idx) {
-      // Always set 'reading' here; showExplainCard will switch to 'explaining' when needed
       el.classList.add(isSkipping ? 'skipping' : 'reading')
       el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      // 親の段落ブロックにもマーカーを付ける
+      const para = el.closest('.para-block')
+      if (para) para.classList.add('has-reading')
     }
   })
   if (idx >= 0) updateProgress(idx, false)
@@ -720,9 +754,14 @@ function showExplainCard(term, body) {
   card.classList.add('fade-up')
 
   // Switch already-highlighted sentence to explaining color
+  document.querySelectorAll('#text-panel .para-block').forEach(el => {
+    el.classList.remove('has-reading', 'has-explaining')
+  })
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
     if (parseInt(el.dataset.idx) === currentIdx) {
       el.classList.remove('reading'); el.classList.add('explaining')
+      const para = el.closest('.para-block')
+      if (para) para.classList.add('has-explaining')
     }
   })
 }
@@ -797,17 +836,59 @@ function renderTextPanel() {
   const panel = document.getElementById('text-panel')
   panel.innerHTML = ''
   const frag = document.createDocumentFragment()
+
+  // sentences を段落ごとのグループに分割する
+  // paraStart=true の文で新しい段落ブロックを開始
+  const paraGroups = []
+  let currentGroup = null
   sentences.forEach((item, i) => {
-    const span = document.createElement('span')
-    span.className   = item.type === 'annotation' ? 'sentence annotation' : 'sentence'
-    span.dataset.idx = i
-    span.textContent = item.text + ' '
-    span.title = item.type === 'annotation'
-      ? 'クリックしてここから開始（注釈と判定された文）'
-      : 'クリックしてここから開始'
-    span.addEventListener('click', () => seekTo(i))
-    frag.appendChild(span)
+    if (item.paraStart || currentGroup === null) {
+      currentGroup = []
+      paraGroups.push(currentGroup)
+    }
+    currentGroup.push({ item, i })
   })
+
+  for (const group of paraGroups) {
+    const paraEl = document.createElement('p')
+    paraEl.className = 'para-block'
+
+    for (const { item, i } of group) {
+      const span = document.createElement('span')
+      let cls = 'sentence'
+      if (item.type === 'annotation') cls += ' annotation'
+      if (item.repaired) cls += ' repaired'
+      span.className   = cls
+      span.dataset.idx = i
+
+      // テキストノード（textContentで安全に）
+      span.appendChild(document.createTextNode(item.text))
+
+      // ツールチップ
+      if (item.repaired && item.original) {
+        span.title = `AI補完済み\n元テキスト: ${item.original}`
+      } else if (item.type === 'annotation') {
+        span.title = 'クリックしてここから開始（注釈と判定された文）'
+      } else {
+        span.title = 'クリックしてここから開始'
+      }
+
+      // 修復済みバッジ
+      if (item.repaired) {
+        const badge = document.createElement('span')
+        badge.className = 'repair-badge'
+        badge.title = item.original ? `元テキスト: ${item.original}` : 'AIが補完'
+        badge.textContent = '✦ AI補完'
+        span.appendChild(badge)
+      }
+
+      span.addEventListener('click', () => seekTo(i))
+      paraEl.appendChild(span)
+    }
+
+    frag.appendChild(paraEl)
+  }
+
   panel.appendChild(frag)
   updateAnnotationHint()
 }
@@ -819,6 +900,9 @@ async function seekTo(idx) {
   cancelSpeech()
 
   // 全文のハイライトをリセットして、選択文を paused 表示
+  document.querySelectorAll('#text-panel .para-block').forEach(el => {
+    el.classList.remove('has-reading', 'has-explaining')
+  })
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
     el.classList.remove('reading', 'explaining', 'paused')
   })
@@ -859,9 +943,13 @@ window.setSkipAnnotations = function(checked) {
 function updateAnnotationHint() {
   const hint = document.getElementById('annotation-count-hint')
   if (!hint) return
-  const count = sentences.filter(s => s.type === 'annotation').length
-  if (count > 0) {
-    hint.textContent = `注釈と判定された文: ${count} / ${sentences.length}文`
+  const annCount    = sentences.filter(s => s.type === 'annotation').length
+  const repairCount = sentences.filter(s => s.repaired).length
+  const parts = []
+  if (annCount > 0)    parts.push(`注釈と判定された文: ${annCount} / ${sentences.length}文`)
+  if (repairCount > 0) parts.push(`AI補完済み文: ${repairCount}件`)
+  if (parts.length > 0) {
+    hint.textContent = parts.join('　')
     hint.style.display = 'block'
   } else {
     hint.style.display = 'none'
@@ -985,7 +1073,7 @@ window.rebuildDictionary = async function() {
   // Re-assemble fullText from sentences for rebuild
   const fullText = sentences.map(s => s.text).join('\n')
   try {
-    const { terms, annotationIndices } = await fetchTermDictionary(sentences, fullText, apiKey)
+    const { terms, annotationIndices, repairs } = await fetchTermDictionary(sentences, fullText, apiKey)
     termDictionary = terms
     explainedWords = new Set()  // reset so re-explained with new mode
     document.getElementById('words-list').innerHTML = ''
@@ -999,6 +1087,22 @@ window.rebuildDictionary = async function() {
         if (sentences[idx]) { sentences[idx].type = 'annotation'; sentences[idx].source = 'ai'; aiCount++ }
       }
       renderTextPanel()
+    }
+
+    // 欠損文の修復を再適用（再ビルド時は既存の修復をいったんリセット）
+    sentences.forEach(s => { if (s.repaired) { s.text = s.original; delete s.repaired; delete s.original } })
+    if (repairs && repairs.length > 0) {
+      let repairCount = 0
+      for (const r of repairs) {
+        if (sentences[r.index]) {
+          sentences[r.index].original = sentences[r.index].text
+          sentences[r.index].text     = r.repaired
+          sentences[r.index].repaired = true
+          repairCount++
+        }
+      }
+      renderTextPanel()
+      addLog(`🔧 欠損文を${repairCount}件AIが補完しました`)
     }
 
     const termCount = Object.keys(termDictionary).length
@@ -1045,6 +1149,9 @@ window.handleStop = async function() {
   // currentIdx をリセットせず、停止位置のハイライトを維持
   currentIdx = pausedAt
   // ハイライトを reading ではなく passive スタイルに切り替え
+  document.querySelectorAll('#text-panel .para-block').forEach(el => {
+    el.classList.remove('has-reading', 'has-explaining')
+  })
   document.querySelectorAll('#text-panel .sentence').forEach(el => {
     el.classList.remove('reading', 'explaining')
     if (parseInt(el.dataset.idx) === pausedAt) el.classList.add('paused')
@@ -1158,6 +1265,7 @@ async function processFile(file) {
       text: s.text,
       type: s.isAside ? 'annotation' : 'body',
       source: 'layout',
+      paraStart: s.paraStart ?? false,
     }))
     renderTextPanel()
 
@@ -1173,7 +1281,7 @@ async function processFile(file) {
       addLog('🤖 Gemini APIで専門用語・本文構造を一括抽出中...')
 
       try {
-        const { terms, annotationIndices } = await fetchTermDictionary(sentences, fullText, apiKey)
+        const { terms, annotationIndices, repairs } = await fetchTermDictionary(sentences, fullText, apiKey)
         termDictionary = terms
         const termCount = Object.keys(termDictionary).length
 
@@ -1191,6 +1299,21 @@ async function processFile(file) {
           addLog(`📚 用語辞書構築完了: ${termCount}語を抽出 / 注釈${aiCount}件をAI判定`)
         } else {
           addLog(`📚 用語辞書構築完了: ${termCount}語を抽出`)
+        }
+
+        // 欠損文の修復を適用
+        if (repairs && repairs.length > 0) {
+          let repairCount = 0
+          for (const r of repairs) {
+            if (sentences[r.index]) {
+              sentences[r.index].original = sentences[r.index].text
+              sentences[r.index].text     = r.repaired
+              sentences[r.index].repaired = true
+              repairCount++
+            }
+          }
+          renderTextPanel()
+          addLog(`🔧 欠損文を${repairCount}件AIが補完しました`)
         }
       } catch (e) {
         showAlert('AI解析エラー: ' + e.message, 'warn')

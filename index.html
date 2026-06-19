@@ -531,11 +531,15 @@ function splitSentences(text) {
       '.\n'
     )
     s = s.replace(/([!?])[ \t]+(?=[A-Z\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FFF])/g, '$1\n')
-    // 見出し行（30字以下で句読点なし）の後にある行は新しい段落扱いにする
-    s = s.replace(/^(.{1,30})(?<![。！？.!?])\n(?=[^\n])/gm, '$1\n\n')
+    // 見出し行（15字以下で句読点・読点なし、かつ次の行が存在する）の後を新しい段落扱いにする。
+    // 30字以下から15字以下に厳格化: 「図1 結果を示す」のような句読点なしの
+    // 通常の短い文（キャプション等）まで見出しと誤判定して不要に分断してしまうのを防ぐ。
+    s = s.replace(/^(.{1,15})(?<![。！？.!?、,])\n(?=[^\n])/gm, '$1\n\n')
     const parts = s.split(/\n+/)
       .map(x => x.trim())
-      .filter(x => x.length >= 4 && !/^[\d\s.]+$/.test(x))
+      // 1〜3文字未満の意味のない断片（OCR/抽出ノイズ）は除外しつつ、
+      // 「はい。」「です。」のような短い完結文は残す（以前は4文字未満を一律除外していた）
+      .filter(x => x.length >= 2 && !/^[\d\s.]+$/.test(x))
     parts.forEach((text, pi) => {
       result.push({ text, paraStart: pi === 0 })
     })
@@ -546,18 +550,13 @@ function splitSentences(text) {
 // ── SPEECH ENGINE ──────────────────────────────────────────────────────────
 function cancelSpeech() { window.speechSynthesis.cancel() }
 
-let keepAliveNudging = false
-
 function startKeepAlive() {
   stopKeepAlive()
   // Chrome stops speaking silently after ~15s; nudge it every 10s
   keepAliveTimer = setInterval(() => {
     if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
-      keepAliveNudging = true
       window.speechSynthesis.pause()
       window.speechSynthesis.resume()
-      // Reset flag after a short delay to allow any spurious events to settle
-      setTimeout(() => { keepAliveNudging = false }, 100)
     }
   }, 10000)
 }
@@ -573,10 +572,14 @@ function speakText(text, rate = 1.0) {
     const u = new SpeechSynthesisUtterance(text)
     u.lang = 'ja-JP'; u.rate = rate; u.pitch = 1.0; u.volume = 1.0
     if (selectedVoice) u.voice = selectedVoice
-    // Guard against onend/onerror both firing (browser quirk)
+    // Guard against onend/onerror both firing (browser quirk).
+    // NOTE: onend must always resolve — never gate it on the keepalive
+    // pause/resume nudge, or a real end-of-speech event landing during
+    // that 100ms window leaves this promise permanently unsettled and
+    // hangs the entire reading loop (runLoop awaits this promise).
     let settled = false
     const done = (fn, v) => { if (settled) return; settled = true; fn(v) }
-    u.onend   = () => { if (!keepAliveNudging) done(resolve, undefined) }
+    u.onend   = () => done(resolve, undefined)
     u.onerror = e  => {
       if (e.error === 'interrupted' || e.error === 'canceled') {
         done(resolve, undefined)
@@ -746,14 +749,18 @@ async function runLoop(resumeFrom = 0) {
       }
       if (abortFlag) break
 
-      // 辞書から未解説の用語を部分一致で探す（1文に複数あれば最初の1つ）
+      // 辞書から未解説の用語を部分一致で探す（1文に複数あれば最長一致を優先）
+      // 例:「ニューラルネットワーク」と「ネットワーク」が両方辞書にある場合、
+      // 短い方が先に見つかって不適切な説明が読まれることがないよう、
+      // 候補を全て集めてから文字数最長のものを選ぶ
       let matchedTerm = null
       let matchedExplanation = null
       for (const [term, explanation] of Object.entries(termDictionary)) {
         if (!explainedWords.has(term) && sentence.includes(term)) {
-          matchedTerm = term
-          matchedExplanation = explanation
-          break
+          if (!matchedTerm || term.length > matchedTerm.length) {
+            matchedTerm = term
+            matchedExplanation = explanation
+          }
         }
       }
 
@@ -1226,8 +1233,15 @@ window.rebuildDictionary = async function() {
     document.getElementById('words-card').style.display = 'none'
 
     if (annotationIndices) {
-      // 注釈分類は用語モードに左右されない判定なので、再生成時も上書き反映する
-      sentences.forEach(s => { if (s.source === 'ai') { s.type = 'body'; s.source = 'layout' } })
+      // 注釈分類は用語モードに左右されない判定なので、再生成時も上書き反映する。
+      // AI判定だった文は、一律 'body' にするのではなく元のレイアウトスコアに
+      // 基づく判定へ正しく戻す（そうしないとレイアウト解析の結果が失われる）
+      sentences.forEach(s => {
+        if (s.source === 'ai') {
+          s.type = (s.asideScore != null && s.asideScore >= ASIDE_SCORE_THRESH) ? 'annotation' : 'body'
+          s.source = 'layout'
+        }
+      })
       let aiCount = 0
       for (const idx of annotationIndices) {
         if (sentences[idx]) { sentences[idx].type = 'annotation'; sentences[idx].source = 'ai'; aiCount++ }
@@ -1408,11 +1422,15 @@ async function processFile(file) {
 
     // レイアウト由来の暫定判定を type/source 付きの正式な形に変換
     // （狭いカラム = サイド注釈の可能性が高い、という簡易ヒューリスティック）
+    // asideScore も保持しておく（AI判定をリセットする際に元のレイアウト判定へ
+    // 正しく戻せるようにするため。失うと rebuildDictionary 時に一律 'body' に
+    // なってしまい、レイアウト解析の結果が消えてしまう）
     sentences = parsed.map(s => ({
       text: s.text,
       type: s.isAside ? 'annotation' : 'body',
       source: 'layout',
       paraStart: s.paraStart ?? false,
+      asideScore: s.asideScore,
     }))
     renderTextPanel()
 
